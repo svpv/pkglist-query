@@ -22,10 +22,21 @@
 #define _GNU_SOURCE // fputs_unlocked
 #endif
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <assert.h>
 #include <pthread.h>
 #include <rpm/rpmlib.h>
+
+// A thread-safe strerror(3) replacement.
+static const char *xstrerror(int errnum)
+{
+    // Some of the great minds say that sys_errlist is deprecated.
+    // Well, at least it's thread-safe, and it does not deadlock.
+    if (errnum > 0 && errnum < sys_nerr)
+	return sys_errlist[errnum];
+    return "Unknown error";
+}
 
 // A job queue entry which needs to be processed: the header blob has to be
 // loaded, queried, and the formatted output string put back to str, with
@@ -104,6 +115,63 @@ void putBack(void *blob, Header h, char *str)
     }
     // Must have put back by now.
     assert(blob == NULL);
+}
+
+// This routine is executed by the helper thread.
+void *worker(void *fmt)
+{
+    void *blob = NULL;
+    Header h = NULL;
+    char *str = NULL;
+    while (1) {
+	// Lock the mutex.
+	int err = pthread_mutex_lock(&Q.mutex);
+	if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
+	// See if they're possible waiting to produce.
+	bool waiting = Q.nq == NQ;
+	// Put back the job from the previous iteration.
+	if (blob) {
+	    putBack(blob, h, str);
+	    blob = NULL, h = NULL, str = NULL;
+	}
+	// If they're possibly waiting to produce, let them know.
+	if (waiting && Q.nq < NQ) {
+	    err = pthread_cond_signal(&Q.can_produce);
+	    if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
+	}
+	// Try to fetch a blob from the queue.
+	while (1) {
+	    for (int i = 0; i < Q.nq; i++) {
+		struct qent *qe = &Q.q[i];
+		if (qe->stage == STAGE_BLOB) {
+		    // NULL blob works as a sentinel.
+		    if (qe->blob == NULL)
+			goto loopbreak;
+		    qe->stage = STAGE_COOKING;
+		    blob = qe->blob;
+		    break;
+		}
+	    }
+	    if (blob)
+		break;
+	    // Wait until something is queued.
+	    err = pthread_cond_wait(&Q.can_consume, &Q.mutex);
+	    if (err) die("%s: %s", "pthread_cond_wait", xstrerror(err));
+	}
+    loopbreak:
+	// Unlock the mutex.
+	err = pthread_mutex_unlock(&Q.mutex);
+	if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
+	// Handle the end of the queue.
+	if (blob == NULL)
+	    return NULL;
+	// Do the job.
+	h = headerImport(blob, 0, HEADERIMPORT_FAST);
+	if (!h) die("headerImport: import failed");
+	const char *fmterr = "format failed";
+	str = headerFormat(h, fmt, &fmterr);
+	if (!str) die("headerFormat: %s", fmterr);
+    }
 }
 
 // ex:set ts=8 sts=4 sw=4 noet:
