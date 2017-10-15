@@ -174,4 +174,114 @@ void *worker(void *fmt)
     }
 }
 
+// Check if the worker needs aid from the main thread.
+void *needAid1(void)
+{
+    for (int i = 0; i < Q.nq; i++) {
+	struct qent *qe = &Q.q[i];
+	if (qe->stage == STAGE_BLOB) {
+	    qe->stage = STAGE_COOKING;
+	    return qe->blob;
+	}
+    }
+    return NULL;
+}
+
+// If there are at least two blobs, returns the first one.
+void *needAid2(void)
+{
+    struct qent *qe0 = NULL;
+    for (int i = 0; i < Q.nq; i++) {
+	struct qent *qe = &Q.q[i];
+	if (qe->stage == STAGE_BLOB) {
+	    if (qe0) {
+		qe0->stage = STAGE_COOKING;
+		return qe0->blob;
+	    }
+	    qe0 = qe;
+	}
+    }
+    return NULL;
+}
+
+// The main thread then can help the worker.
+void aid(void *blob, const char *fmt)
+{
+    // Unlock the mutex.
+    int err = pthread_mutex_unlock(&Q.mutex);
+    if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
+    // Do the job.
+    Header h = headerImport(blob, 0, HEADERIMPORT_FAST);
+    if (!h) die("headerImport: import failed");
+    const char *fmterr = "format failed";
+    char *str = headerFormat(h, fmt, &fmterr);
+    if (!str) die("headerFormat: %s", fmterr);
+    // Lock the mutex.
+    err = pthread_mutex_lock(&Q.mutex);
+    if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
+    // Put back.
+    putBack(blob, h, str);
+}
+
+// Dispatch the blob, called from the main thread.
+void processBlob(void *blob, const char *fmt)
+{
+    // Lock the mutex.
+    int err = pthread_mutex_lock(&Q.mutex);
+    if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
+    // Try to help while the queue is full.  But we also need
+    // to keep the worker busy while decoding the next blob,
+    // so don't grab the very last one.
+    while (Q.nq == NQ) {
+	void *blob = needAid2();
+	if (blob) {
+	    aid(blob, fmt);
+	    continue;
+	}
+	// Wait until the queue is flushed.
+	err = pthread_cond_wait(&Q.can_produce, &Q.mutex);
+	if (err) die("%s: %s", "pthread_cond_wait", xstrerror(err));
+    }
+    // Put the blob to the queue.
+    Q.q[Q.nq++] = (struct qent) { { blob }, STAGE_BLOB };
+    // If they're waiting to consume, let them know.
+    err = pthread_cond_signal(&Q.can_consume);
+    if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
+    // Unlock the mutex.
+    err = pthread_mutex_unlock(&Q.mutex);
+    if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
+}
+
+// Drain the queue and join the worker thread.
+void finish(pthread_t thread, const char *fmt)
+{
+    // Lock the mutex.
+    int err = pthread_mutex_lock(&Q.mutex);
+    if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
+    // Help as much as possible.
+    while (1) {
+	void *blob = needAid1();
+	if (blob)
+	    aid(blob, fmt);
+	else
+	    break;
+    }
+    // Still need to wait if the queue is full.
+    while (Q.nq == NQ) {
+	err = pthread_cond_wait(&Q.can_produce, &Q.mutex);
+	if (err) die("%s: %s", "pthread_cond_wait", xstrerror(err));
+    }
+    // Put the sentinel.
+    Q.q[Q.nq++] = (struct qent) { { NULL }, STAGE_BLOB };
+    // Let them know.
+    err = pthread_cond_signal(&Q.can_consume);
+    if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
+    // Unlock the mutex.
+    err = pthread_mutex_unlock(&Q.mutex);
+    if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
+    // Join the worker thread.
+    err = pthread_join(thread, NULL);
+    if (err) die("%s: %s", "pthread_join", xstrerror(err));
+}
+
 // ex:set ts=8 sts=4 sw=4 noet:
