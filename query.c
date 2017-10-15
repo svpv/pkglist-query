@@ -18,7 +18,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // fputs_unlocked
+#endif
+
+#include <stdio.h>
+#include <assert.h>
 #include <pthread.h>
+#include <rpm/rpmlib.h>
 
 // A job queue entry which needs to be processed: the header blob has to be
 // loaded, queried, and the formatted output string put back to str, with
@@ -45,5 +52,58 @@ struct {
     PTHREAD_COND_INITIALIZER,
     PTHREAD_COND_INITIALIZER,
 };
+
+#define PROG "pkglist-query"
+
+#define die(fmt, args...) \
+do { \
+    fprintf(stderr, PROG ": " fmt "\n", ##args); \
+    exit(2); \
+} while (0)
+
+// After formatting is done, put the string back and flush the queue,
+// picking up earlier strings and printing them in the original order.
+void putBack(void *blob, Header h, char *str)
+{
+    int i;
+    // Flush the queue.
+    for (i = 0; i < Q.nq; i++) {
+	struct qent *qe = &Q.q[i];
+	if (qe->stage == STAGE_STR) {
+	    if (fputs_unlocked(qe->str, stdout) == EOF)
+		die("%s: %m", "fputs");
+	    free(qe->str);
+	}
+	else if (qe->stage == STAGE_COOKING && qe->blob == blob) {
+	    if (fputs_unlocked(str, stdout) == EOF)
+		die("%s: %m", "fputs");
+	    free(str);
+	    headerFree(h);
+	    // The blob has been freed on behalf of headerFree.
+	    blob = NULL;
+	}
+	else
+	    break;
+    }
+    // Advance the queue.
+    Q.nq -= i;
+    memmove(Q.q, Q.q + i, Q.nq * sizeof(struct qent));
+    // Was it put back?
+    if (blob == NULL)
+	return;
+    // Still need to put back.
+    for (i = 1; i < Q.nq; i++) {
+	struct qent *qe = &Q.q[i];
+	if (qe->stage == STAGE_COOKING && qe->blob == blob) {
+	    qe->str = str;
+	    qe->stage = STAGE_STR;
+	    headerFree(h);
+	    blob = NULL;
+	    break;
+	}
+    }
+    // Must have put back by now.
+    assert(blob == NULL);
+}
 
 // ex:set ts=8 sts=4 sw=4 noet:
