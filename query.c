@@ -49,7 +49,9 @@ struct qent {
 
 // The number of entries in the job queue.
 // Should be just high enough to provide parallelism.
-#define NQ 8
+#ifndef NQ
+#define NQ 128
+#endif
 
 // The job queue.
 struct {
@@ -57,7 +59,7 @@ struct {
     pthread_cond_t can_produce;
     pthread_cond_t can_consume;
     int nq;
-    struct qent q[NQ];
+    struct qent q[NQ+1];
 } Q = {
     PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_COND_INITIALIZER,
@@ -72,6 +74,24 @@ do { \
     exit(2); \
 } while (0)
 
+// Search a blob in Q.q starting with qe.
+static inline struct qent *findBlob(struct qent *qe)
+{
+    struct qent *end = Q.q + Q.nq;
+    end->stage = STAGE_BLOB;
+    // Cf. Quicker sequential search in [Knuth, Vol.3, p.398].
+    while (1) {
+	if (qe[0].stage == STAGE_BLOB) break;
+	if (qe[1].stage == STAGE_BLOB) { qe += 1; break; }
+	if (qe[2].stage == STAGE_BLOB) { qe += 2; break; }
+	if (qe[3].stage == STAGE_BLOB) { qe += 3; break; }
+	qe += 4;
+    }
+    if (qe == end)
+	return NULL;
+    return qe;
+}
+
 // After formatting is done, put the string back and flush the queue,
 // picking up earlier strings and printing them in the original order.
 void putBack(void *blob, Header h, char *str)
@@ -85,7 +105,8 @@ void putBack(void *blob, Header h, char *str)
 		die("%s: %m", "fputs");
 	    free(qe->str);
 	}
-	else if (qe->stage == STAGE_COOKING && qe->blob == blob) {
+	else if (blob && qe->blob == blob) {
+	    assert(qe->stage == STAGE_COOKING);
 	    if (fputs_unlocked(str, stdout) == EOF)
 		die("%s: %m", "fputs");
 	    free(str);
@@ -103,18 +124,18 @@ void putBack(void *blob, Header h, char *str)
     if (blob == NULL)
 	return;
     // Still need to put back.
-    for (i = 1; i < Q.nq; i++) {
-	struct qent *qe = &Q.q[i];
-	if (qe->stage == STAGE_COOKING && qe->blob == blob) {
-	    qe->str = str;
-	    qe->stage = STAGE_STR;
-	    headerFree(h);
-	    blob = NULL;
-	    break;
-	}
+    struct qent *qe = Q.q + 1;
+    while (1) {
+	if (qe[0].blob == blob) break;
+	if (qe[1].blob == blob) { qe += 1; break; }
+	if (qe[2].blob == blob) { qe += 2; break; }
+	if (qe[3].blob == blob) { qe += 3; break; }
+	qe += 4;
     }
-    // Must have put back by now.
-    assert(blob == NULL);
+    assert(qe->stage == STAGE_COOKING);
+    qe->str = str;
+    qe->stage = STAGE_STR;
+    headerFree(h);
 }
 
 // This routine is executed by the helper thread.
@@ -141,24 +162,16 @@ void *worker(void *fmt)
 	}
 	// Try to fetch a blob from the queue.
 	while (1) {
-	    for (int i = 0; i < Q.nq; i++) {
-		struct qent *qe = &Q.q[i];
-		if (qe->stage == STAGE_BLOB) {
-		    // NULL blob works as a sentinel.
-		    if (qe->blob == NULL)
-			goto loopbreak;
-		    qe->stage = STAGE_COOKING;
-		    blob = qe->blob;
-		    break;
-		}
-	    }
-	    if (blob)
+	    struct qent *qe = findBlob(Q.q);
+	    if (qe) {
+		qe->stage = STAGE_COOKING;
+		blob = qe->blob;
 		break;
+	    }
 	    // Wait until something is queued.
 	    err = pthread_cond_wait(&Q.can_consume, &Q.mutex);
 	    if (err) die("%s: %s", "pthread_cond_wait", xstrerror(err));
 	}
-    loopbreak:
 	// Unlock the mutex.
 	err = pthread_mutex_unlock(&Q.mutex);
 	if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
@@ -177,31 +190,23 @@ void *worker(void *fmt)
 // Check if the worker needs aid from the main thread.
 void *needAid1(void)
 {
-    for (int i = 0; i < Q.nq; i++) {
-	struct qent *qe = &Q.q[i];
-	if (qe->stage == STAGE_BLOB) {
-	    qe->stage = STAGE_COOKING;
-	    return qe->blob;
-	}
-    }
-    return NULL;
+    struct qent *qe = findBlob(Q.q);
+    if (!qe)
+	return NULL;
+    qe->stage = STAGE_COOKING;
+    return qe->blob;
 }
 
 // If there are at least two blobs, returns the first one.
 void *needAid2(void)
 {
-    struct qent *qe0 = NULL;
-    for (int i = 0; i < Q.nq; i++) {
-	struct qent *qe = &Q.q[i];
-	if (qe->stage == STAGE_BLOB) {
-	    if (qe0) {
-		qe0->stage = STAGE_COOKING;
-		return qe0->blob;
-	    }
-	    qe0 = qe;
-	}
-    }
-    return NULL;
+    struct qent *qe = findBlob(Q.q);
+    if (!qe)
+	return NULL;
+    if (!findBlob(qe + 1))
+	return NULL;
+    qe->stage = STAGE_COOKING;
+    return qe->blob;
 }
 
 // The main thread then can help the worker.
