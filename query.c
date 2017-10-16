@@ -18,10 +18,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE // fputs_unlocked
-#endif
-
 #include <stdbool.h>
 #include <stdio.h>
 #include <assert.h>
@@ -44,6 +40,7 @@ static const char *xstrerror(int errnum)
 // printed in the original order.
 struct qent {
     union { void *blob; char *str; };
+    union { unsigned blobSize; unsigned len; };
     enum { STAGE_BLOB, STAGE_COOKING, STAGE_STR } stage;
 };
 
@@ -94,21 +91,21 @@ static inline struct qent *findBlob(struct qent *qe)
 
 // After formatting is done, put the string back and flush the queue,
 // picking up earlier strings and printing them in the original order.
-void putBack(void *blob, Header h, char *str)
+void putBack(void *blob, Header h, char *str, size_t len)
 {
     int i;
     // Flush the queue.
     for (i = 0; i < Q.nq; i++) {
 	struct qent *qe = &Q.q[i];
 	if (qe->stage == STAGE_STR) {
-	    if (fputs_unlocked(qe->str, stdout) == EOF)
-		die("%s: %m", "fputs");
+	    if (fwrite_unlocked(qe->str, 1, qe->len, stdout) != qe->len)
+		die("%s: %m", "fwrite");
 	    free(qe->str);
 	}
 	else if (blob && qe->blob == blob) {
 	    assert(qe->stage == STAGE_COOKING);
-	    if (fputs_unlocked(str, stdout) == EOF)
-		die("%s: %m", "fputs");
+	    if (fwrite_unlocked(str, 1, len, stdout) != len)
+		die("%s: %m", "fwrite");
 	    free(str);
 	    headerFree(h);
 	    // The blob has been freed on behalf of headerFree.
@@ -134,6 +131,8 @@ void putBack(void *blob, Header h, char *str)
     }
     assert(qe->stage == STAGE_COOKING);
     qe->str = str;
+    assert(len < ~0U);
+    qe->len = len;
     qe->stage = STAGE_STR;
     headerFree(h);
 }
@@ -144,6 +143,7 @@ void *worker(void *fmt)
     void *blob = NULL;
     Header h = NULL;
     char *str = NULL;
+    size_t len = 0;
     while (1) {
 	// Lock the mutex.
 	int err = pthread_mutex_lock(&Q.mutex);
@@ -152,7 +152,7 @@ void *worker(void *fmt)
 	bool waiting = Q.nq == NQ;
 	// Put back the job from the previous iteration.
 	if (blob) {
-	    putBack(blob, h, str);
+	    putBack(blob, h, str, len);
 	    blob = NULL, h = NULL, str = NULL;
 	}
 	// If they're possibly waiting to produce, let them know.
@@ -161,11 +161,13 @@ void *worker(void *fmt)
 	    if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
 	}
 	// Try to fetch a blob from the queue.
+	unsigned blobSize;
 	while (1) {
 	    struct qent *qe = findBlob(Q.q);
 	    if (qe) {
-		qe->stage = STAGE_COOKING;
 		blob = qe->blob;
+		blobSize = qe->blobSize;
+		qe->stage = STAGE_COOKING;
 		break;
 	    }
 	    // Wait until something is queued.
@@ -179,26 +181,27 @@ void *worker(void *fmt)
 	if (blob == NULL)
 	    return NULL;
 	// Do the job.
-	h = headerImport(blob, 0, HEADERIMPORT_FAST);
+	h = headerImport(blob, blobSize, HEADERIMPORT_FAST);
 	if (!h) die("headerImport: import failed");
 	const char *fmterr = "format failed";
 	str = headerFormat(h, fmt, &fmterr);
 	if (!str) die("headerFormat: %s", fmterr);
+	len = strlen(str);
     }
 }
 
 // Check if the worker needs aid from the main thread.
-void *needAid1(void)
+struct qent *needAid1(void)
 {
     struct qent *qe = findBlob(Q.q);
     if (!qe)
 	return NULL;
     qe->stage = STAGE_COOKING;
-    return qe->blob;
+    return qe;
 }
 
 // If there are at least two blobs, returns the first one.
-void *needAid2(void)
+struct qent *needAid2(void)
 {
     struct qent *qe = findBlob(Q.q);
     if (!qe)
@@ -206,30 +209,31 @@ void *needAid2(void)
     if (!findBlob(qe + 1))
 	return NULL;
     qe->stage = STAGE_COOKING;
-    return qe->blob;
+    return qe;
 }
 
 // The main thread then can help the worker.
-void aid(void *blob, const char *fmt)
+void aid(void *blob, unsigned blobSize, const char *fmt)
 {
     // Unlock the mutex.
     int err = pthread_mutex_unlock(&Q.mutex);
     if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
     // Do the job.
-    Header h = headerImport(blob, 0, HEADERIMPORT_FAST);
+    Header h = headerImport(blob, blobSize, HEADERIMPORT_FAST);
     if (!h) die("headerImport: import failed");
     const char *fmterr = "format failed";
     char *str = headerFormat(h, fmt, &fmterr);
     if (!str) die("headerFormat: %s", fmterr);
+    size_t len = strlen(str);
     // Lock the mutex.
     err = pthread_mutex_lock(&Q.mutex);
     if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
     // Put back.
-    putBack(blob, h, str);
+    putBack(blob, h, str, len);
 }
 
 // Dispatch the blob, called from the main thread.
-void processBlob(void *blob, const char *fmt)
+void processBlob(void *blob, unsigned blobSize, const char *fmt)
 {
     // Lock the mutex.
     int err = pthread_mutex_lock(&Q.mutex);
@@ -238,9 +242,9 @@ void processBlob(void *blob, const char *fmt)
     // to keep the worker busy while decoding the next blob,
     // so don't grab the very last one.
     while (Q.nq == NQ) {
-	void *blob = needAid2();
-	if (blob) {
-	    aid(blob, fmt);
+	struct qent *qe = needAid2();
+	if (qe) {
+	    aid(qe->blob, qe->blobSize, fmt);
 	    continue;
 	}
 	// Wait until the queue is flushed.
@@ -248,7 +252,7 @@ void processBlob(void *blob, const char *fmt)
 	if (err) die("%s: %s", "pthread_cond_wait", xstrerror(err));
     }
     // Put the blob to the queue.
-    Q.q[Q.nq++] = (struct qent) { { blob }, STAGE_BLOB };
+    Q.q[Q.nq++] = (struct qent) { { blob }, { blobSize }, STAGE_BLOB };
     // If they're waiting to consume, let them know.
     err = pthread_cond_signal(&Q.can_consume);
     if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
@@ -265,9 +269,9 @@ void finish(pthread_t thread, const char *fmt)
     if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
     // Help as much as possible.
     while (1) {
-	void *blob = needAid1();
-	if (blob)
-	    aid(blob, fmt);
+	struct qent *qe = needAid1();
+	if (qe)
+	    aid(qe->blob, qe->blobSize, fmt);
 	else
 	    break;
     }
@@ -277,7 +281,7 @@ void finish(pthread_t thread, const char *fmt)
 	if (err) die("%s: %s", "pthread_cond_wait", xstrerror(err));
     }
     // Put the sentinel.
-    Q.q[Q.nq++] = (struct qent) { { NULL }, STAGE_BLOB };
+    Q.q[Q.nq++] = (struct qent) { { NULL }, { 0 }, STAGE_BLOB };
     // Let them know.
     err = pthread_cond_signal(&Q.can_consume);
     if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
@@ -302,7 +306,7 @@ void processFd(int fd, const char *fname, const char *fmt)
 	void *blob;
 	func = "zpkglistNextMalloc";
 	while ((ret = zpkglistNextMalloc(z, &blob, NULL, false, err)) > 0)
-	    processBlob(blob, fmt);
+	    processBlob(blob, ret, fmt);
 	zpkglistFree(z);
     }
     close(fd);
