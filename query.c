@@ -284,4 +284,82 @@ void finish(pthread_t thread, const char *fmt)
     if (err) die("%s: %s", "pthread_join", xstrerror(err));
 }
 
+#include <unistd.h>
+#include <zpkglist.h>
+
+void processFd(int fd, const char *fname, const char *fmt)
+{
+    const char *err[2];
+    struct zpkglistReader *z;
+    const char *func = "zpkglistFdopen";
+    ssize_t ret = zpkglistFdopen(&z, fd, err);
+    if (ret > 0) {
+	void *blob;
+	func = "zpkglistNextMalloc";
+	while ((ret = zpkglistNextMalloc(z, &blob, NULL, false, err)) > 0)
+	    processBlob(blob, fmt);
+	zpkglistFree(z);
+    }
+    close(fd);
+    if (ret < 0) {
+	if (strcmp(func, err[0]) == 0 || strncmp(err[0], "zpkglist", 8) == 0)
+	    die("%s: %s: %s", fname, err[0], err[1]);
+	else
+	    die("%s: %s: %s: %s", fname, func, err[0], err[1]);
+    }
+}
+
+#include <getopt.h>
+#include <fcntl.h> // O_RDONLY
+
+const struct option longopts[] = {
+    { "help", no_argument, NULL, 'h' },
+    { NULL },
+};
+
+int main(int argc, char **argv)
+{
+    bool usage = false;
+    int c;
+    while ((c = getopt_long(argc, argv, "h", longopts, NULL)) != -1)
+	usage = true;
+    if (usage) {
+usage:	fprintf(stderr, "Usage: " PROG " FMT [PKGLIST...]\n");
+	return 1;
+    }
+    argc -= optind, argv += optind;
+    if (argc < 1) {
+	fprintf(stderr, PROG ": not enought arguments\n");
+	goto usage;
+    }
+    const char *fmt = argv[0];
+    argc--, argv++;
+    if (argc < 1 && isatty(0)) {
+	fprintf(stderr, PROG ": refusing to read binary data from a terminal\n");
+	goto usage;
+    }
+    char *assume_argv[] = { "-", NULL };
+    if (argc < 1)
+	argc = 1, argv = assume_argv;
+    pthread_t thread;
+    int err = pthread_create(&thread, NULL, worker, (void *) fmt);
+    if (err) die("%s: %s", "pthread_create", xstrerror(err));
+    for (int i = 0; i < argc; i++) {
+	int fd = 0;
+	const char *fname = argv[i];
+	if (strcmp(argv[i], "-") == 0)
+	    fname = "<stdin>";
+	else {
+	    fd = open(fname, O_RDONLY);
+	    if (fd < 0)
+		die("%s: open: %m", fname);
+	}
+	processFd(fd, fname, fmt);
+    }
+    finish(thread, fmt);
+    if (fflush_unlocked(stdout) == EOF)
+	die("%s: %m", "fflush");
+    return 0;
+}
+
 // ex:set ts=8 sts=4 sw=4 noet:
