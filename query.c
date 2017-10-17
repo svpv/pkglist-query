@@ -39,7 +39,7 @@ static const char *xstrerror(int errnum)
 // the stage updated accordingly.  The strings then will be picked up and
 // printed in the original order.
 struct qent {
-    union { void *blob; char *str; };
+    union { void *blob; unsigned cookie; char *str; };
     union { unsigned blobSize; unsigned len; };
     enum { STAGE_BLOB, STAGE_COOKING, STAGE_STR } stage;
 };
@@ -55,6 +55,8 @@ struct {
     pthread_mutex_t mutex;
     pthread_cond_t can_produce;
     pthread_cond_t can_consume;
+    // An ever increasing sequence number used as a cookie.
+    unsigned seq;
     // The sum of the blob sizes of STAGE_BLOB entries.
     size_t blobBytes;
     // The total number of STAGE_BLOB entries in the queue.
@@ -94,7 +96,7 @@ static inline struct qent *findBlob(struct qent *qe)
 
 // After formatting is done, put the string back and flush the queue,
 // picking up earlier strings and printing them in the original order.
-void putBack(void *blob, Header h, char *str, size_t len)
+void putBack(unsigned cookie, char *str, size_t len)
 {
     int i;
     // Flush the queue.
@@ -105,14 +107,11 @@ void putBack(void *blob, Header h, char *str, size_t len)
 		die("%s: %m", "fwrite");
 	    free(qe->str);
 	}
-	else if (blob && qe->blob == blob) {
-	    assert(qe->stage == STAGE_COOKING);
+	else if (qe->stage == STAGE_COOKING && qe->cookie == cookie) {
 	    if (fwrite_unlocked(str, 1, len, stdout) != len)
 		die("%s: %m", "fwrite");
 	    free(str);
-	    headerFree(h);
-	    // The blob has been freed on behalf of headerFree.
-	    blob = NULL;
+	    str = NULL;
 	}
 	else
 	    break;
@@ -121,30 +120,27 @@ void putBack(void *blob, Header h, char *str, size_t len)
     Q.nq -= i;
     memmove(Q.q, Q.q + i, Q.nq * sizeof(struct qent));
     // Was it put back?
-    if (blob == NULL)
+    if (str == NULL)
 	return;
     // Still need to put back.
     struct qent *qe = Q.q + 1;
     while (1) {
-	if (qe[0].blob == blob) break;
-	if (qe[1].blob == blob) { qe += 1; break; }
-	if (qe[2].blob == blob) { qe += 2; break; }
-	if (qe[3].blob == blob) { qe += 3; break; }
+	if (qe[0].stage == STAGE_COOKING && qe[0].cookie == cookie) break;
+	if (qe[1].stage == STAGE_COOKING && qe[1].cookie == cookie) { qe += 1; break; }
+	if (qe[2].stage == STAGE_COOKING && qe[2].cookie == cookie) { qe += 2; break; }
+	if (qe[3].stage == STAGE_COOKING && qe[3].cookie == cookie) { qe += 3; break; }
 	qe += 4;
     }
-    assert(qe->stage == STAGE_COOKING);
     qe->str = str;
     assert(len < ~0U);
     qe->len = len;
     qe->stage = STAGE_STR;
-    headerFree(h);
 }
 
 // This routine is executed by the helper thread.
 void *worker(void *fmt)
 {
-    void *blob = NULL;
-    Header h = NULL;
+    unsigned cookie = 0;
     char *str = NULL;
     size_t len = 0;
     while (1) {
@@ -154,9 +150,9 @@ void *worker(void *fmt)
 	// See if they're possible waiting to produce.
 	bool waiting = Q.nq == NQ;
 	// Put back the job from the previous iteration.
-	if (blob) {
-	    putBack(blob, h, str, len);
-	    blob = NULL, h = NULL, str = NULL;
+	if (str) {
+	    putBack(cookie, str, len);
+	    cookie = 0, str = NULL, len = 0;
 	}
 	// If they're possibly waiting to produce, let them know.
 	if (waiting && Q.nq < NQ) {
@@ -164,12 +160,14 @@ void *worker(void *fmt)
 	    if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
 	}
 	// Try to fetch a blob from the queue.
+	void *blob;
 	unsigned blobSize;
 	while (1) {
 	    if (Q.nblob) {
 		struct qent *qe = findBlob(Q.q);
 		blob = qe->blob;
 		blobSize = qe->blobSize;
+		cookie = qe->cookie = Q.seq++;
 		qe->stage = STAGE_COOKING;
 		Q.nblob--, Q.blobBytes -= blobSize;
 		break;
@@ -185,11 +183,13 @@ void *worker(void *fmt)
 	if (blob == NULL)
 	    return NULL;
 	// Do the job.
-	h = headerImport(blob, blobSize, HEADERIMPORT_FAST);
+	Header h = headerImport(blob, blobSize, HEADERIMPORT_FAST);
 	if (!h) die("headerImport: import failed");
 	const char *fmterr = "format failed";
 	str = headerFormat(h, fmt, &fmterr);
 	if (!str) die("headerFormat: %s", fmterr);
+	// The blob is freed on behalf of headerFree.
+	headerFree(h);
 	len = strlen(str);
     }
 }
@@ -199,10 +199,7 @@ struct qent *needAid1(void)
 {
     if (Q.nblob < 1)
 	return NULL;
-    struct qent *qe = findBlob(Q.q);
-    qe->stage = STAGE_COOKING;
-    Q.nblob--, Q.blobBytes -= qe->blobSize;
-    return qe;
+    return findBlob(Q.q);
 }
 
 // If there are at least two blobs, returns the first one.
@@ -210,15 +207,19 @@ struct qent *needAid2(void)
 {
     if (Q.nblob < 2)
 	return NULL;
-    struct qent *qe = findBlob(Q.q);
-    qe->stage = STAGE_COOKING;
-    Q.nblob--, Q.blobBytes -= qe->blobSize;
-    return qe;
+    return findBlob(Q.q);
 }
 
 // The main thread then can help the worker.
-void aid(void *blob, unsigned blobSize, const char *fmt)
+void aid(struct qent *qe, const char *fmt)
 {
+    void *blob = qe->blob;
+    unsigned blobSize = qe->blobSize;
+    // We're under the same lock as needAid(),
+    // complete the transition to the cooking stage.
+    unsigned cookie = qe->cookie = Q.seq++;
+    qe->stage = STAGE_COOKING;
+    Q.nblob--, Q.blobBytes -= blobSize;
     // Unlock the mutex.
     int err = pthread_mutex_unlock(&Q.mutex);
     if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
@@ -228,12 +229,13 @@ void aid(void *blob, unsigned blobSize, const char *fmt)
     const char *fmterr = "format failed";
     char *str = headerFormat(h, fmt, &fmterr);
     if (!str) die("headerFormat: %s", fmterr);
+    headerFree(h);
     size_t len = strlen(str);
     // Lock the mutex.
     err = pthread_mutex_lock(&Q.mutex);
     if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
     // Put back.
-    putBack(blob, h, str, len);
+    putBack(cookie, str, len);
 }
 
 // Dispatch the blob, called from the main thread.
@@ -248,7 +250,7 @@ void processBlob(void *blob, unsigned blobSize, const char *fmt)
     while (Q.nq == NQ) {
 	struct qent *qe = needAid2();
 	if (qe) {
-	    aid(qe->blob, qe->blobSize, fmt);
+	    aid(qe, fmt);
 	    continue;
 	}
 	// Wait until the queue is flushed.
@@ -278,7 +280,7 @@ void finish(pthread_t thread, const char *fmt)
     while (1) {
 	struct qent *qe = needAid1();
 	if (qe)
-	    aid(qe->blob, qe->blobSize, fmt);
+	    aid(qe, fmt);
 	else
 	    break;
     }
