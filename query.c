@@ -210,6 +210,31 @@ struct qent *needAid2(void)
     return findBlob(Q.q);
 }
 
+// If the number of blobs in the queue is roughly below this size,
+// the main tread will keep pumping up the queue with new blobs.
+// Otherwise, the main thread will also consider the possibility of
+// helping the worker thread to cope with the already loaded blobs.
+#define MINBLOB 16
+
+static_assert(MINBLOB >= 4, "MINBLOB is not too small");
+static_assert(NQ >= 2 * MINBLOB, "NQ is not too small");
+
+// An advanced strategy for the main thread.
+struct qent *needMoreAid(void)
+{
+    // Too few blobs?
+    if (Q.nblob < MINBLOB * 3 / 4)
+	return NULL;
+    struct qent *qe = findBlob(Q.q);
+    // The blob shouldn't be too big, as compared to other blobs.
+    // But note that we're averaging over MINBLOB, not Q.nblob.
+    // This means that, if the blob seems too big for now, it might
+    // be taken next time, after the main thread pushes another blob.
+    if (qe->blobSize > Q.blobBytes / MINBLOB)
+	return NULL;
+    return qe;
+}
+
 // The main thread then can help the worker.
 void aid(struct qent *qe, const char *fmt)
 {
@@ -264,6 +289,13 @@ void processBlob(void *blob, unsigned blobSize, const char *fmt)
     if (Q.nblob == 1) {
 	err = pthread_cond_signal(&Q.can_consume);
 	if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
+    }
+    // See if more help is desirable.
+    while (1) {
+	struct qent *qe = needMoreAid();
+	if (!qe)
+	    break;
+	aid(qe, fmt);
     }
     // Unlock the mutex.
     err = pthread_mutex_unlock(&Q.mutex);
