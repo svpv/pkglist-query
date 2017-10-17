@@ -55,6 +55,10 @@ struct {
     pthread_mutex_t mutex;
     pthread_cond_t can_produce;
     pthread_cond_t can_consume;
+    // The sum of the blob sizes of STAGE_BLOB entries.
+    size_t blobBytes;
+    // The total number of STAGE_BLOB entries in the queue.
+    int nblob;
     int nq;
     struct qent q[NQ+1];
 } Q = {
@@ -84,8 +88,7 @@ static inline struct qent *findBlob(struct qent *qe)
 	if (qe[3].stage == STAGE_BLOB) { qe += 3; break; }
 	qe += 4;
     }
-    if (qe == end)
-	return NULL;
+    assert(qe < end);
     return qe;
 }
 
@@ -163,11 +166,12 @@ void *worker(void *fmt)
 	// Try to fetch a blob from the queue.
 	unsigned blobSize;
 	while (1) {
-	    struct qent *qe = findBlob(Q.q);
-	    if (qe) {
+	    if (Q.nblob) {
+		struct qent *qe = findBlob(Q.q);
 		blob = qe->blob;
 		blobSize = qe->blobSize;
 		qe->stage = STAGE_COOKING;
+		Q.nblob--, Q.blobBytes -= blobSize;
 		break;
 	    }
 	    // Wait until something is queued.
@@ -193,22 +197,22 @@ void *worker(void *fmt)
 // Check if the worker needs aid from the main thread.
 struct qent *needAid1(void)
 {
-    struct qent *qe = findBlob(Q.q);
-    if (!qe)
+    if (Q.nblob < 1)
 	return NULL;
+    struct qent *qe = findBlob(Q.q);
     qe->stage = STAGE_COOKING;
+    Q.nblob--, Q.blobBytes -= qe->blobSize;
     return qe;
 }
 
 // If there are at least two blobs, returns the first one.
 struct qent *needAid2(void)
 {
+    if (Q.nblob < 2)
+	return NULL;
     struct qent *qe = findBlob(Q.q);
-    if (!qe)
-	return NULL;
-    if (!findBlob(qe + 1))
-	return NULL;
     qe->stage = STAGE_COOKING;
+    Q.nblob--, Q.blobBytes -= qe->blobSize;
     return qe;
 }
 
@@ -253,9 +257,12 @@ void processBlob(void *blob, unsigned blobSize, const char *fmt)
     }
     // Put the blob to the queue.
     Q.q[Q.nq++] = (struct qent) { { blob }, { blobSize }, STAGE_BLOB };
-    // If they're waiting to consume, let them know.
-    err = pthread_cond_signal(&Q.can_consume);
-    if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
+    Q.nblob++, Q.blobBytes += blobSize;
+    // If they're possibly waiting to consume, let them know.
+    if (Q.nblob == 1) {
+	err = pthread_cond_signal(&Q.can_consume);
+	if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
+    }
     // Unlock the mutex.
     err = pthread_mutex_unlock(&Q.mutex);
     if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
@@ -282,6 +289,7 @@ void finish(pthread_t thread, const char *fmt)
     }
     // Put the sentinel.
     Q.q[Q.nq++] = (struct qent) { { NULL }, { 0 }, STAGE_BLOB };
+    Q.nblob++;
     // Let them know.
     err = pthread_cond_signal(&Q.can_consume);
     if (err) die("%s: %s", "pthread_cond_signal", xstrerror(err));
@@ -291,6 +299,8 @@ void finish(pthread_t thread, const char *fmt)
     // Join the worker thread.
     err = pthread_join(thread, NULL);
     if (err) die("%s: %s", "pthread_join", xstrerror(err));
+    // Verify the bookkeeping.
+    assert(Q.nblob == 0), assert(Q.blobBytes == 0);
 }
 
 #include <unistd.h>
