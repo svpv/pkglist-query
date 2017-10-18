@@ -63,7 +63,7 @@ struct {
     // The total number of STAGE_BLOB entries in the queue.
     int nblob;
     int nq;
-    struct qent q[NQ+1];
+    struct qent q[NQ];
 } Q = {
     PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_COND_INITIALIZER,
@@ -81,8 +81,6 @@ do { \
 // Search a blob in Q.q starting with qe.
 static inline struct qent *findBlob(struct qent *qe)
 {
-    struct qent *end = Q.q + Q.nq;
-    end->stage = STAGE_BLOB;
     // Cf. Quicker sequential search in [Knuth, Vol.3, p.398].
     while (1) {
 	if (qe[0].stage == STAGE_BLOB) break;
@@ -91,7 +89,6 @@ static inline struct qent *findBlob(struct qent *qe)
 	if (qe[3].stage == STAGE_BLOB) { qe += 3; break; }
 	qe += 4;
     }
-    assert(qe < end);
     return qe;
 }
 
