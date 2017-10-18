@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
 #include <pthread.h>
@@ -39,7 +40,7 @@ static const char *xstrerror(int errnum)
 // the stage updated accordingly.  The strings then will be picked up and
 // printed in the original order.
 struct qent {
-    union { void *blob; unsigned cookie; char *str; };
+    union { void *blob; uintptr_t cookie; char *str; };
     union { unsigned blobSize; unsigned len; };
     enum { STAGE_BLOB, STAGE_COOKING, STAGE_STR } stage;
 };
@@ -56,7 +57,7 @@ struct {
     pthread_cond_t can_produce;
     pthread_cond_t can_consume;
     // An ever increasing sequence number used as a cookie.
-    unsigned seq;
+    uintptr_t seq;
     // The sum of the blob sizes of STAGE_BLOB entries.
     size_t blobBytes;
     // The total number of STAGE_BLOB entries in the queue.
@@ -96,7 +97,7 @@ static inline struct qent *findBlob(struct qent *qe)
 
 // After formatting is done, put the string back and flush the queue,
 // picking up earlier strings and printing them in the original order.
-void putBack(unsigned cookie, char *str, size_t len)
+void putBack(uintptr_t cookie, char *str, size_t len)
 {
     int i;
     // Flush the queue.
@@ -107,7 +108,7 @@ void putBack(unsigned cookie, char *str, size_t len)
 		die("%s: %m", "fwrite");
 	    free(qe->str);
 	}
-	else if (qe->stage == STAGE_COOKING && qe->cookie == cookie) {
+	else if (qe->cookie == cookie) {
 	    if (fwrite_unlocked(str, 1, len, stdout) != len)
 		die("%s: %m", "fwrite");
 	    free(str);
@@ -125,10 +126,10 @@ void putBack(unsigned cookie, char *str, size_t len)
     // Still need to put back.
     struct qent *qe = Q.q + 1;
     while (1) {
-	if (qe[0].stage == STAGE_COOKING && qe[0].cookie == cookie) break;
-	if (qe[1].stage == STAGE_COOKING && qe[1].cookie == cookie) { qe += 1; break; }
-	if (qe[2].stage == STAGE_COOKING && qe[2].cookie == cookie) { qe += 2; break; }
-	if (qe[3].stage == STAGE_COOKING && qe[3].cookie == cookie) { qe += 3; break; }
+	if (qe[0].cookie == cookie) break;
+	if (qe[1].cookie == cookie) { qe += 1; break; }
+	if (qe[2].cookie == cookie) { qe += 2; break; }
+	if (qe[3].cookie == cookie) { qe += 3; break; }
 	qe += 4;
     }
     qe->str = str;
@@ -140,7 +141,7 @@ void putBack(unsigned cookie, char *str, size_t len)
 // This routine is executed by the helper thread.
 void *worker(void *fmt)
 {
-    unsigned cookie = 0;
+    uintptr_t cookie = 0;
     char *str = NULL;
     size_t len = 0;
     while (1) {
@@ -167,7 +168,9 @@ void *worker(void *fmt)
 		struct qent *qe = findBlob(Q.q);
 		blob = qe->blob;
 		blobSize = qe->blobSize;
-		cookie = qe->cookie = Q.seq++;
+		// Make an odd cookie so that it never equals
+		// an aligned pointer such as malloc'd blob or str.
+		cookie = qe->cookie = (Q.seq++, Q.seq++);
 		qe->stage = STAGE_COOKING;
 		Q.nblob--, Q.blobBytes -= blobSize;
 		break;
@@ -242,7 +245,7 @@ void aid(struct qent *qe, const char *fmt)
     unsigned blobSize = qe->blobSize;
     // We're under the same lock as needAid(),
     // complete the transition to the cooking stage.
-    unsigned cookie = qe->cookie = Q.seq++;
+    uintptr_t cookie = qe->cookie = (Q.seq++, Q.seq++);
     qe->stage = STAGE_COOKING;
     Q.nblob--, Q.blobBytes -= blobSize;
     // Unlock the mutex.
