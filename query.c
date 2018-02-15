@@ -71,12 +71,8 @@ struct {
 };
 
 #define PROG "pkglist-query"
-
-#define die(fmt, args...) \
-do { \
-    fprintf(stderr, PROG ": " fmt "\n", ##args); \
-    exit(2); \
-} while (0)
+#define warn(fmt, args...) fprintf(stderr, "%s: " fmt "\n", PROG, ##args)
+#define die(fmt, args...) warn(fmt, ##args), exit(128) // like git
 
 // Search a blob in Q.q starting with qe.
 static inline struct qent *findBlob(struct qent *qe)
@@ -145,7 +141,7 @@ void *worker(void *fmt)
 	// Lock the mutex.
 	int err = pthread_mutex_lock(&Q.mutex);
 	if (err) die("%s: %s", "pthread_mutex_lock", xstrerror(err));
-	// See if they're possible waiting to produce.
+	// See if they're possibly waiting to produce.
 	bool waiting = Q.nq == NQ;
 	// Put back the job from the previous iteration.
 	if (str) {
@@ -176,7 +172,7 @@ void *worker(void *fmt)
 	    err = pthread_cond_wait(&Q.can_consume, &Q.mutex);
 	    if (err) die("%s: %s", "pthread_cond_wait", xstrerror(err));
 	}
-	// Unlock the mutex.
+	// Got a blob, unlock the mutex.
 	err = pthread_mutex_unlock(&Q.mutex);
 	if (err) die("%s: %s", "pthread_mutex_unlock", xstrerror(err));
 	// Handle the end of the queue.
@@ -211,7 +207,7 @@ struct qent *needAid2(void)
 }
 
 // If the number of blobs in the queue is roughly below this size,
-// the main tread will keep pumping up the queue with new blobs.
+// the main thread will keep pumping up the queue with new blobs.
 // Otherwise, the main thread will also consider the possibility of
 // helping the worker thread to cope with the already loaded blobs.
 #define MINBLOB 16
@@ -382,13 +378,13 @@ usage:	fprintf(stderr, "Usage: " PROG " FMT [PKGLIST...]\n");
     }
     argc -= optind, argv += optind;
     if (argc < 1) {
-	fprintf(stderr, PROG ": not enought arguments\n");
+	warn("not enough arguments");
 	goto usage;
     }
     const char *fmt = argv[0];
     argc--, argv++;
     if (argc < 1 && isatty(0)) {
-	fprintf(stderr, PROG ": refusing to read binary data from a terminal\n");
+	warn("refusing to read binary data from a terminal");
 	goto usage;
     }
     char *assume_argv[] = { "-", NULL };
