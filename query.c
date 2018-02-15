@@ -45,11 +45,14 @@ struct qent {
     enum { STAGE_BLOB, STAGE_COOKING, STAGE_STR } stage;
 };
 
-// The number of entries in the job queue.
-// Should be just high enough to provide parallelism.
-#ifndef NQ
+// The maximum number of entries in the job queue.
+// Good parallelism can be achieved only with a somewhat big queue:
+// - src.rpm headers can be as small as 1K, while zstd decompression
+//   operates in 128K chunks; see also MINBYTES below;
+// - on the other hand, a big header (e.g. with many %{Filenames}) can
+//   take a lot of time to headerFormat, and if the second thread fills
+//   the remaining slots quickly, the only alternative for it is to stall.
 #define NQ 128
-#endif
 
 // The job queue.
 struct {
@@ -211,6 +214,9 @@ struct qent *needAid2(void)
 // Otherwise, the main thread will also consider the possibility of
 // helping the worker thread to cope with the already loaded blobs.
 #define MINBLOB 16
+// Also, because decompressors operate in chunks, the total byte count
+// shouldn't drop much below the chunk size.
+#define MINBYTES (128<<10)
 
 static_assert(MINBLOB >= 4, "MINBLOB is not too small");
 static_assert(NQ >= 2 * MINBLOB, "NQ is not too small");
@@ -218,6 +224,9 @@ static_assert(NQ >= 2 * MINBLOB, "NQ is not too small");
 // An advanced strategy for the main thread.
 struct qent *needMoreAid(void)
 {
+    // Too few bytes left?  Time to recharge the decompressor.
+    if (Q.blobBytes < MINBYTES)
+	return NULL;
     // Too few blobs?
     if (Q.nblob < MINBLOB * 3 / 4)
 	return NULL;
